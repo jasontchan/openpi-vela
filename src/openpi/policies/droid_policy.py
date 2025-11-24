@@ -38,6 +38,7 @@ class DroidInputs(transforms.DataTransformFn):
             # Ensure gripper position is a 1D array, not a scalar, so we can concatenate with joint positions
             gripper_pos = gripper_pos[np.newaxis]
         state = np.concatenate([data["observation/joint_position"], gripper_pos])
+        # emg = np.asarray(data["observation/emg"])
 
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
@@ -70,6 +71,9 @@ class DroidInputs(transforms.DataTransformFn):
             if isinstance(data["prompt"], bytes):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
+        
+        if "observation/emg" in data or "emg" in data:
+            inputs["emg"] = data["observation/emg"]
 
         return inputs
 

@@ -28,9 +28,10 @@ class Pi0Config(_model.BaseModelConfig):
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
-    pi05: bool = False
+    pi05: bool = True
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    emg: bool = False
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -105,4 +106,6 @@ class Pi0Config(_model.BaseModelConfig):
             )
         if not filters:
             return nnx.Nothing
+        # print(f"FREEZE FILTERRRR: {filters}", flush=True)
+        # raise KeyboardInterrupt
         return nnx.All(*filters)

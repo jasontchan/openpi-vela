@@ -66,6 +66,7 @@ def posemb_sincos(
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.config = config
         self.pi05 = config.pi05
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -99,8 +100,50 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        if config.emg:
+            self.emg_proj = nnx.Linear(17, paligemma_config.width, rngs=rngs)
+            self.emg_ln = nnx.LayerNorm(16, epsilon=1e-5, use_scale=True, use_bias=True, rngs=rngs)
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+    
+    @at.typecheck
+    def prepare_emg(
+        self, batch: at.Float[at.Array, "b wl ce"]
+    ) -> at.Float[at.Array, "b k cc"]:
+        emgs = batch
+        #double check emg dimensions are correct given batch (inference vs training etc)
+        #grab the last window_size timesteps 
+        emg_n_bins = 10
+        emg_window_size = 50
+
+        bin_size = emg_window_size // emg_n_bins
+        #split emgs into bins of size 'emg_bin_size'
+        emg_bins = jnp.stack(jnp.split(emgs, bin_size, axis=1), axis=1)
+        emg_bins = jnp.mean(emg_bins, axis=2, keepdims=False) # (B, K, C)
+
+        #amplitude (how strong the EMG signal is)
+
+        amplitude = jnp.sqrt(jnp.mean(jnp.power(emg_bins, 2), axis=-1, keepdims=True)) #(B, K, 1)
+        # amplitude = emg_bins.pow(2).mean(axis=-1, keepdim=True).sqrt() # (B, K, 1)
+        amplitude = jnp.clip((amplitude / (650 + 1e-6)), 0, 1.5) # normalize by 95th percentile
+
+        #spatial encoding (how the EMG signal is distributed across channels)
+        spatial_emg = emg_bins / (amplitude + 1e-6) # (B, K, C)
+        
+        #temporal encoding (how the EMG signal is distributed across time)
+        temporal_emg = jnp.pad(
+            emg_bins[:, 1:, :] - emg_bins[:, :-1, :], ((0, 0), (1, 0), (0, 0)) #pad first time dimension
+        ) #(B, K, C)
+        temporal_emg = temporal_emg / (jnp.linalg.norm(temporal_emg, axis=-1, keepdims=True) + 1e-6) # (B, K, C)
+
+        emgs = jnp.concatenate(
+            [spatial_emg, temporal_emg, amplitude], axis=-1
+        ) # (B, K, 2C+1)
+        print(f"EMGS SHAPE {emgs.shape}", flush=True)
+            
+        return emgs
+        
 
     @at.typecheck
     def embed_prefix(
@@ -126,14 +169,33 @@ class Pi0(_model.BaseModel):
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
+            print(f"obs.tokenized_prompt {obs.tokenized_prompt}")
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # add emg here
+        if self.config.emg: # (32, 100, 8) ie (b, wl, ce)
+            print(f"OBSERVATION EMG: {obs.emg}. size: {obs.emg.shape}")
+            prepped_emg = self.prepare_emg(obs.emg)
+            emg_ln = jnp.concatenate((self.emg_ln(prepped_emg[:, :, :-1]), prepped_emg[:, :, -1:]), axis=-1)
+            emg_tokens = self.emg_proj(emg_ln)
+            tokens.append(emg_tokens)
+
+            #make input_mask
+            b = obs.emg.shape[0]
+            seq_len = emg_tokens.shape[1]
+            input_mask.append(jnp.ones((b, seq_len), dtype=jnp.bool_))
+
+            #make a new block
+            ar_mask += [True] + [False] * (emg_tokens.shape[1] - 1) 
+    
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+        print(f"tokens size {tokens.shape}. input mask size {input_mask.shape}. ar_mask size {ar_mask.shape}")
         return tokens, input_mask, ar_mask
 
     @at.typecheck

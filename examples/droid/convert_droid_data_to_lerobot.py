@@ -26,7 +26,7 @@ from PIL import Image
 from tqdm import tqdm
 import tyro
 
-REPO_NAME = "your_hf_username/my_droid_dataset"  # Name of the output dataset, also used for the Hugging Face Hub
+# REPO_NAME = "jasontchan/task1-1"  # Name of the output dataset, also used for the Hugging Face Hub
 
 
 def resize_image(image, size):
@@ -34,9 +34,9 @@ def resize_image(image, size):
     return np.array(image.resize(size, resample=Image.BICUBIC))
 
 
-def main(data_dir: str, *, push_to_hub: bool = False):
+def main(data_dir: str, *, push_to_hub: bool = True, contains_emg=True, override_language: str =None, repo_name: str = "jasontchan/"):
     # Clean up any existing dataset in the output directory
-    output_path = HF_LEROBOT_HOME / REPO_NAME
+    output_path = HF_LEROBOT_HOME / repo_name
     if output_path.exists():
         shutil.rmtree(output_path)
     data_dir = Path(data_dir)
@@ -44,50 +44,87 @@ def main(data_dir: str, *, push_to_hub: bool = False):
     # Create LeRobot dataset, define features to store
     # We will follow the DROID data naming conventions here.
     # LeRobot assumes that dtype of image data is `image`
-    dataset = LeRobotDataset.create(
-        repo_id=REPO_NAME,
-        robot_type="panda",
-        fps=15,  # DROID data is typically recorded at 15fps
-        features={
-            # We call this "left" since we will only use the left stereo camera (following DROID RLDS convention)
-            "exterior_image_1_left": {
-                "dtype": "image",
-                "shape": (180, 320, 3),  # This is the resolution used in the DROID RLDS dataset
-                "names": ["height", "width", "channel"],
+    if contains_emg:
+        dataset = LeRobotDataset.create(
+            repo_id=repo_name,
+            robot_type="panda",
+            fps=15,  # DROID data is typically recorded at 15fps
+            features={
+                # We call this "left" since we will only use the left stereo camera (following DROID RLDS convention)
+                "exterior_image_1_left": {
+                    "dtype": "image",
+                    "shape": (180, 320, 3),  # This is the resolution used in the DROID RLDS dataset
+                    "names": ["height", "width", "channel"],
+                },
+                "wrist_image_left": {
+                    "dtype": "image",
+                    "shape": (180, 320, 3),
+                    "names": ["height", "width", "channel"],
+                },
+                "joint_position": {
+                    "dtype": "float32",
+                    "shape": (7,),
+                    "names": ["joint_position"],
+                },
+                "gripper_position": {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["gripper_position"],
+                },
+                "actions": {
+                    "dtype": "float32",
+                    "shape": (8,),  # We will use joint *velocity* actions here (7D) + gripper position (1D)
+                    "names": ["actions"],
+                },
+                "emg": {
+                    "dtype": "float32",
+                    "shape": (100, 8),
+                    "names": ["time", "channels"]
+                }
             },
-            "exterior_image_2_left": {
-                "dtype": "image",
-                "shape": (180, 320, 3),
-                "names": ["height", "width", "channel"],
+            image_writer_threads=10,
+            image_writer_processes=5,
+        )
+    else:
+        dataset = LeRobotDataset.create(
+            repo_id=repo_name,
+            robot_type="panda",
+            fps=15,  # DROID data is typically recorded at 15fps
+            features={
+                # We call this "left" since we will only use the left stereo camera (following DROID RLDS convention)
+                "exterior_image_1_left": {
+                    "dtype": "image",
+                    "shape": (180, 320, 3),  # This is the resolution used in the DROID RLDS dataset
+                    "names": ["height", "width", "channel"],
+                },
+                "wrist_image_left": {
+                    "dtype": "image",
+                    "shape": (180, 320, 3),
+                    "names": ["height", "width", "channel"],
+                },
+                "joint_position": {
+                    "dtype": "float32",
+                    "shape": (7,),
+                    "names": ["joint_position"],
+                },
+                "gripper_position": {
+                    "dtype": "float32",
+                    "shape": (1,),
+                    "names": ["gripper_position"],
+                },
+                "actions": {
+                    "dtype": "float32",
+                    "shape": (8,),  # We will use joint *velocity* actions here (7D) + gripper position (1D)
+                    "names": ["actions"],
+                },
             },
-            "wrist_image_left": {
-                "dtype": "image",
-                "shape": (180, 320, 3),
-                "names": ["height", "width", "channel"],
-            },
-            "joint_position": {
-                "dtype": "float32",
-                "shape": (7,),
-                "names": ["joint_position"],
-            },
-            "gripper_position": {
-                "dtype": "float32",
-                "shape": (1,),
-                "names": ["gripper_position"],
-            },
-            "actions": {
-                "dtype": "float32",
-                "shape": (8,),  # We will use joint *velocity* actions here (7D) + gripper position (1D)
-                "names": ["actions"],
-            },
-        },
-        image_writer_threads=10,
-        image_writer_processes=5,
-    )
+            image_writer_threads=10,
+            image_writer_processes=5,
+        )
 
     # Load language annotations
     # Note: we load the DROID language annotations for this example, but you can manually define them for your own data
-    with (data_dir / "aggregated-annotations-030724.json").open() as f:
+    with (data_dir / "aggregated-annotations-custom.json").open() as f:
         language_annotations = json.load(f)
 
     # Loop over raw DROID fine-tuning datasets and write episodes to the LeRobot dataset
@@ -115,6 +152,8 @@ def main(data_dir: str, *, push_to_hub: bool = False):
         language_instruction = language_annotations.get(episode_id, {"language_instruction1": "Do something"})[
             "language_instruction1"
         ]
+        if override_language is not None: #for emg trials
+            language_instruction = override_language
         print(f"Converting episode with language instruction: {language_instruction}")
 
         # Write to LeRobot dataset
@@ -122,29 +161,57 @@ def main(data_dir: str, *, push_to_hub: bool = False):
             camera_type_dict = step["observation"]["camera_type"]
             wrist_ids = [k for k, v in camera_type_dict.items() if v == 0]
             exterior_ids = [k for k, v in camera_type_dict.items() if v != 0]
-            dataset.add_frame(
-                {
-                    # Note: need to flip BGR --> RGB for loaded images
-                    "exterior_image_1_left": resize_image(
-                        step["observation"]["image"][exterior_ids[0]][..., ::-1], (320, 180)
-                    ),
-                    "exterior_image_2_left": resize_image(
-                        step["observation"]["image"][exterior_ids[1]][..., ::-1], (320, 180)
-                    ),
-                    "wrist_image_left": resize_image(step["observation"]["image"][wrist_ids[0]][..., ::-1], (320, 180)),
-                    "joint_position": np.asarray(
-                        step["observation"]["robot_state"]["joint_positions"], dtype=np.float32
-                    ),
-                    "gripper_position": np.asarray(
-                        step["observation"]["robot_state"]["gripper_position"][None], dtype=np.float32
-                    ),
-                    # Important: we use joint velocity actions here since pi05-droid was pre-trained on joint velocity actions
-                    "actions": np.concatenate(
-                        [step["action"]["joint_velocity"], step["action"]["gripper_position"][None]], dtype=np.float32
-                    ),
-                    "task": language_instruction,
-                }
-            )
+            if contains_emg:
+                dataset.add_frame(
+                    {
+                        # Note: need to flip BGR --> RGB for loaded images
+                        "exterior_image_1_left": resize_image(
+                            step["observation"]["image"][exterior_ids[0]][..., ::-1], (320, 180)
+                        ),
+                        # "exterior_image_2_left": resize_image(
+                        #     step["observation"]["image"][exterior_ids[1]][..., ::-1], (320, 180)
+                        # ),
+                        "wrist_image_left": resize_image(step["observation"]["image"][wrist_ids[0]][..., ::-1], (320, 180)),
+                        "joint_position": np.asarray(
+                            step["observation"]["robot_state"]["joint_positions"], dtype=np.float32
+                        ),
+                        "gripper_position": np.asarray(
+                            step["observation"]["robot_state"]["gripper_position"][None], dtype=np.float32
+                        ),
+                        # Important: we use joint velocity actions here since pi05-droid was pre-trained on joint velocity actions
+                        "actions": np.concatenate(
+                            [step["action"]["joint_velocity"], step["action"]["gripper_position"][None]], dtype=np.float32
+                        ),
+                        "emg": np.asarray(
+                            step["observation"]["emg_lower"], dtype=np.float32
+                        ),
+                        "task": language_instruction,
+                    }
+                )
+            else:
+                dataset.add_frame(
+                    {
+                        # Note: need to flip BGR --> RGB for loaded images
+                        "exterior_image_1_left": resize_image(
+                            step["observation"]["image"][exterior_ids[0]][..., ::-1], (320, 180)
+                        ),
+                        # "exterior_image_2_left": resize_image(
+                        #     step["observation"]["image"][exterior_ids[1]][..., ::-1], (320, 180)
+                        # ),
+                        "wrist_image_left": resize_image(step["observation"]["image"][wrist_ids[0]][..., ::-1], (320, 180)),
+                        "joint_position": np.asarray(
+                            step["observation"]["robot_state"]["joint_positions"], dtype=np.float32
+                        ),
+                        "gripper_position": np.asarray(
+                            step["observation"]["robot_state"]["gripper_position"][None], dtype=np.float32
+                        ),
+                        # Important: we use joint velocity actions here since pi05-droid was pre-trained on joint velocity actions
+                        "actions": np.concatenate(
+                            [step["action"]["joint_velocity"], step["action"]["gripper_position"][None]], dtype=np.float32
+                        ),
+                        "task": language_instruction,
+                    }
+                )
         dataset.save_episode()
 
     # Optionally push to the Hugging Face Hub
@@ -393,7 +460,6 @@ class TrajectoryReader:
 
         # Increment Read Index #
         self._index += 1
-
         # Return Timestep #
         return timestep
 

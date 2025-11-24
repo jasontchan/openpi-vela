@@ -435,7 +435,7 @@ def convert_pi0_checkpoint(
     print(f"Model config: {model_config}")
 
     # Break down orbax ckpts by restoring via JAX to respect dtype
-    initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float32")
+    initial_params = slice_initial_orbax_checkpoint(checkpoint_dir=checkpoint_dir, restore_precision="float16")
 
     # Process projection params
     if model_config.pi05:
@@ -510,14 +510,18 @@ def convert_pi0_checkpoint(
         expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
     )
 
+    print(f"right before instantiating the model")
     # Instantiate model
     pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
+    print(f"right after instantiating the model")
 
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
     # Load state dict
+    print(f"right before load state dict")
     pi0_model.load_state_dict(all_params, strict=False)
+    print(f"right after load state dict")
 
     if precision == "float32":
         pi0_model = pi0_model.to(torch.float32)
@@ -525,9 +529,11 @@ def convert_pi0_checkpoint(
         pi0_model = pi0_model.to(torch.bfloat16)
     else:
         raise ValueError(f"Invalid precision: {precision}")
+    print(f"right before makedirs")
 
     # Save the converted model using safetensors
     os.makedirs(output_path, exist_ok=True)
+    print(f"right after makedirs")
 
     # Save model weights as SafeTensors using save_model to handle tied weights
     safetensors.torch.save_model(pi0_model, os.path.join(output_path, "model.safetensors"))

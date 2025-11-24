@@ -55,10 +55,14 @@ class WebsocketPolicyServer:
         while True:
             try:
                 start_time = time.monotonic()
+                print("before obs")
                 obs = msgpack_numpy.unpackb(await websocket.recv())
+                print("after obs")
 
                 infer_time = time.monotonic()
+                print("before infer")
                 action = self._policy.infer(obs)
+                print("after infer")
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {

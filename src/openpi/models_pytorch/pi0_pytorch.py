@@ -89,13 +89,17 @@ class PI0Pytorch(nn.Module):
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+        print(f"before paligemmawithexpertmodel")
 
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
-            precision=config.dtype,
+            # precision=config.dtype,
+            precision="bfloat16",
         )
+        print(f"after paligemmawithexpert model")
+
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)

@@ -11,6 +11,7 @@ from jaxtyping import ArrayLike
 from jaxtyping import Bool  # noqa: F401
 from jaxtyping import DTypeLike  # noqa: F401
 from jaxtyping import Float
+from jaxtyping import Float32
 from jaxtyping import Int  # noqa: F401
 from jaxtyping import Key  # noqa: F401
 from jaxtyping import Num  # noqa: F401

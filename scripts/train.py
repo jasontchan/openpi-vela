@@ -70,16 +70,86 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.run.log_code(epath.Path(__file__).parent.parent)
 
 
-def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
-    """Loads and validates the weights. Returns a loaded subset of the weights."""
-    loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+# def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
+#     """Loads and validates the weights. Returns a loaded subset of the weights."""
+#     loaded_params = loader.load(params_shape)
+#     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
-    return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
-    )
+#     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
+#     return traverse_util.unflatten_dict(
+#         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
+#     )
 
+def _subset_and_validate_loaded(loaded_params, params_shape):
+    """Keep only keys present in params_shape. Validate shape/dtype for kept keys."""
+    lf = traverse_util.flatten_dict(loaded_params, sep="/")
+    sf = traverse_util.flatten_dict(params_shape, sep="/")
+
+    subset = {}
+    for k, v in lf.items():
+        if k not in sf:
+            continue
+        # params_shape holds ShapeDtypeStruct placeholders at leaves
+        exp = sf[k]
+        # If the loader returns ShapeDtypeStruct for missing leaves, skip them.
+        if isinstance(v, jax.ShapeDtypeStruct):
+            continue
+        # Validate shape/dtype where we do have real arrays
+        if isinstance(exp, jax.ShapeDtypeStruct):
+            if getattr(v, "shape", None) != exp.shape or getattr(v, "dtype", None) != exp.dtype:
+                raise ValueError(
+                    f"Loaded leaf {k} has shape/dtype {getattr(v,'shape',None)}/{getattr(v,'dtype',None)} "
+                    f"but expected {exp.shape}/{exp.dtype}."
+                )
+        subset[k] = v
+
+    return traverse_util.unflatten_dict({tuple(k.split("/")): v for k, v in subset.items()})
+
+def _load_weights_and_validate(loader, params_shape):
+    """Loads weights non-strictly: keep only intersection, validate those, drop the rest."""
+    loaded_params = loader.load(params_shape)  # may contain fewer leaves
+    return _subset_and_validate_loaded(loaded_params, params_shape)
+
+
+def debug_print_filter_matches(params, flt, title="FILTERRRR freeze", max_lines=2000):
+    """
+    params: an nnx.State or params dict
+    flt:    your nnx.filterlib.Filter (e.g., config.freeze_filter or trainable_filter)
+    """
+    # Convert to a pure dict and flatten
+    pdict = params.to_pure_dict() if hasattr(params, "to_pure_dict") else params
+    flat = traverse_util.flatten_dict(pdict, sep="/")
+
+    matches, misses = [], []
+    for k, v in flat.items():
+        # Some leaves are not nnx.Param; filterlib usually expects (path, leaf)
+        path_tuple = tuple(k.split("/"))
+        try:
+            is_match = bool(flt(path_tuple, v))
+        except TypeError:
+            # If your Filter expects only the path, fallback:
+            is_match = bool(flt(path_tuple))
+        (matches if is_match else misses).append(k)
+
+    print(f"\n[{title}] matched {len(matches)} / {len(flat)} leaves")
+    for i, k in enumerate(matches[:max_lines]):
+        print("  FROZEN →", k)
+    if len(matches) > max_lines:
+        print(f"  ... and {len(matches) - max_lines} more")
+
+def debug_apply_filter_on_state(params, flt, title, max_lines=200):
+    matches = []
+    # params.items() yields (path, leaf) with leaf possibly nnx.Param
+    for path, leaf in params.items():  # <-- keeps nnx.Param
+        try:
+            ok = bool(flt(path, leaf))
+        except TypeError:
+            ok = bool(flt(path))  # fallback if filter ignores leaf
+        if ok:
+            matches.append("/".join(path))
+    print(f"\n[{title}] matched {len(matches)} leaves")
+    for k in matches[:max_lines]:
+        print("  ", k)
 
 @at.typecheck
 def init_train_state(
@@ -100,9 +170,21 @@ def init_train_state(
             model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
+        emg = params.filter(lambda p, _: p and p[0].startswith(("emg_proj","emg_norm","emg_to_pali")))
+        print("EMG leaves:", list(traverse_util.flatten_dict(emg.to_pure_dict(), sep="/").keys()))
+        print("EMG trainable?",
+        len(traverse_util.flatten_dict(params.filter(config.trainable_filter)
+                                     .filter(lambda p,_: p and p[0].startswith(("emg_proj","emg_norm","emg_to_pali")))
+                                     .to_pure_dict(), sep="/")) > 0)
+
+        debug_apply_filter_on_state(params, config.trainable_filter, title="TRAINABLEEE")
+        # raise KeyboardInterrupt
+        
         # Convert frozen params to bfloat16.
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
+
+    
         return training_utils.TrainState(
             step=0,
             params=params,
@@ -234,6 +316,27 @@ def main(config: _config.TrainConfig):
     wandb.log({"camera_views": images_to_log}, step=0)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    # from flax.core import traverse_util
+
+    def list_paths(state):
+        return list(traverse_util.flatten_dict(state.to_pure_dict(), sep="/").keys())
+
+    # 1) Confirm EMG params exist
+    emg_all = train_state.params.filter(lambda p, _:
+        p and p[0].startswith(("emg_proj","emg_norm","emg_to_pali")))
+    print("EMG params:", list_paths(emg_all))
+
+    # 2) Confirm EMG are trainable (i.e., selected by trainable_filter)
+    emg_trainable = (train_state.params
+                    .filter(config.trainable_filter)
+                    .filter(lambda p,_: p and p[0].startswith(("emg_proj","emg_norm","emg_to_pali"))))
+    print("EMG trainable:", len(list_paths(emg_trainable)) > 0)
+
+    # 3) (Optional) Count optimizer slots for EMG (proves they’re being optimized)
+    opt_leaves = train_state.params.filter(config.trainable_filter)
+    opt_keys = set(list_paths(opt_leaves))
+    for k in list_paths(emg_all):
+        print(k, "→ in optimizer:", k in opt_keys)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
