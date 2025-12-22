@@ -178,6 +178,10 @@ class Pi0(_model.BaseModel):
 
         # add emg here
         if self.config.emg: # (32, 100, 8) ie (b, wl, ce)
+            #embed emg via vae
+            emg_tokens = self.emg_vae(obs.emg)
+
+
             print(f"OBSERVATION EMG: {obs.emg}. size: {obs.emg.shape}")
             prepped_emg = self.prepare_emg(obs.emg)
             emg_ln = jnp.concatenate((self.emg_ln(prepped_emg[:, :, :-1]), prepped_emg[:, :, -1:]), axis=-1)
