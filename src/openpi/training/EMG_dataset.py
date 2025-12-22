@@ -13,7 +13,7 @@ class EMGIterableDataset(IterableDataset):
         emg_key: str = "emg",
         expected_shape: tuple[int, int] = (100, 8),
         transform=None,
-        drop_bad_rows: bool = True,
+        drop_bad_rows: bool = False,
     ):
         """
         - repo_id: HF dataset repo id
@@ -33,7 +33,8 @@ class EMGIterableDataset(IterableDataset):
         self.ds = load_dataset(
             self.repo_id,
             split=self.split,
-            streaming=True,
+            streaming=False,
+            columns=[self.emg_key],
         )
  
     def __iter__(self):
@@ -46,7 +47,9 @@ class EMGIterableDataset(IterableDataset):
             emg = row[self.emg_key]
 
             try:
-                x = torch.tensor(emg[:50, :], dtype=torch.float32) #NOTE: window should only be last second (50 samples)
+                x = torch.tensor(emg, dtype=torch.float32) #NOTE: window should only be last second (50 samples)
+                x = x[-50:, :]  # Take last 50 samples
+                x /= 1000.0
             except Exception as e:
                 if self.drop_bad_rows:
                     continue

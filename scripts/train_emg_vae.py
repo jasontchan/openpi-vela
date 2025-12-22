@@ -1,12 +1,19 @@
 import numpy as np
 import torch
-
+from datetime import datetime
+import os
+from dataclasses import asdict
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
+from flax import serialization
+import orbax.checkpoint as ocp
+import json
+from pathlib import Path
 from torch.utils.data import IterableDataset, DataLoader
 from openpi.models.emg_vae import EMGVAE
+from openpi.models.emg_vae_config import EMGVAEConfig
 from openpi.training.EMG_dataset import EMGIterableDataset, emg_collate
 
 def torch_batch_to_jax(batch_torch: torch.Tensor) -> jax.Array:
@@ -27,7 +34,7 @@ def vae_loss(x: jax.Array, x_hat: jax.Array, mu: jax.Array, logvar: jax.Array,
     return recon + beta * kl
 
 
-@nnx.jit 
+# @nnx.jit 
 def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: jax.Array,
                beta: float) -> jax.Array:
     """
@@ -45,36 +52,87 @@ def train_step(model: nnx.Module, optimizer: nnx.Optimizer, batch: jax.Array,
     optimizer.update(grads)
     return loss
 
-dataset = EMGIterableDataset(repo_id="jasontchan/task123-23-12345-12_MU", split="train", emg_key="emg", expected_shape=(100, 8), drop_bad_rows=True)
-loader = DataLoader(dataset, batch_size=32, 
-                     num_workers=0,
-                     collate_fn=emg_collate, 
-                     pin_memory=True, 
-                   )
 
-rngs = nnx.Rngs(0, noise=1)
+def save_vae(model: nnx.Module, cfg: dict, out_dir: str):
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
-model = EMGVAE(c_in=8, latent_dim=128, rngs=rngs)
+    graphdef, state = nnx.split(model)
 
-lr = 1e-3
-opt = optax.adam(lr)
-optimizer = nnx.Optimizer(model, opt)
+    # Save graphdef/state using orbax PyTreeCheckpointer
+    ckpt = {"graphdef": graphdef, "state": state}
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(out / "ckpt", ckpt, force=True)
 
-num_epochs = 10
-beta = 2.0 
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
 
-for epoch in range(num_epochs):
-    train_loss = 0.0
-    n_batches = 0
+def load_vae(vae_ctor, in_dir: str, *, rngs: nnx.Rngs):
+    inp = Path(in_dir)
+    cfg = json.loads((inp / "config.json").read_text())
 
-    for i, batch_torch in enumerate(loader):
-        batch = torch_batch_to_jax(batch_torch)
+    # Rebuild template to get correct structure types
+    template = vae_ctor(cfg, rngs)
+    graphdef_t, state_t = nnx.split(template)
 
-        loss = train_step(model, optimizer, batch, beta=beta)
-        train_loss += float(loss)
-        n_batches += 1
+    checkpointer = ocp.PyTreeCheckpointer()
+    ckpt = checkpointer.restore(inp / "ckpt", item={"graphdef": graphdef_t, "state": state_t})
 
-        if (i + 1) % 50 == 0:
-            print(f"Epoch {epoch} | step {i+1} | loss {float(loss):.5f}")
+    model = nnx.merge(ckpt["graphdef"], ckpt["state"])
+    return model, cfg
 
-    print(f"Train epoch: {epoch}, avg loss: {train_loss / max(n_batches, 1):.5f}")
+if __name__ == "__main__":
+    dataset = EMGIterableDataset(repo_id="jasontchan/task123-23-12345-12_MU", split="train", emg_key="emg", expected_shape=(50, 8), drop_bad_rows=False)
+    loader = DataLoader(dataset, batch_size=32, 
+                        num_workers=0,
+                        collate_fn=emg_collate, 
+                        pin_memory=True, 
+                    )
+
+    rngs = nnx.Rngs(0, noise=1)
+
+    model = EMGVAE(c_in=8, latent_dim=64, rngs=rngs)
+    cfg = EMGVAEConfig(
+        c_in=8,
+        latent_dim=64,
+        widths=(32, 64, 64),
+        kernels=(5, 5, 3),
+        strides=(2, 2, 1),
+    )
+    lr = 1e-3
+    opt = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(lr),
+    )
+    optimizer = nnx.Optimizer(model, opt)
+
+    num_epochs = 25
+    beta = 2.0 
+
+    current_time = datetime.now()
+    timestamp_str = current_time.strftime("%Y-%m-%d_%H-%M-%S")
+    ckpt_root = f"/lambda/nfs/filesystem1/openpi-vela/checkpoints/emg_vae/{timestamp_str}"
+    os.makedirs(ckpt_root, exist_ok=True)
+
+    best_loss = float("inf")
+    for epoch in range(num_epochs):
+        train_loss = 0.0
+        n_batches = 0
+
+        for i, batch_torch in enumerate(loader):
+            batch = torch_batch_to_jax(batch_torch)
+
+            loss = train_step(model, optimizer, batch, beta=beta)
+            train_loss += float(loss)
+            n_batches += 1
+
+            if (i + 1) % 50 == 0:
+                print(f"Epoch {epoch} | step {i+1} | loss {float(loss):.5f}")
+        # save per-epoch
+        save_vae(model, asdict(cfg), f"{ckpt_root}/epoch_{epoch:03d}")
+
+        # save best
+        avg_loss = train_loss / max(n_batches, 1)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_vae(model, asdict(cfg), f"{ckpt_root}/best")
+        print(f"Train epoch: {epoch}, avg loss: {avg_loss:.5f}")

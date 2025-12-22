@@ -13,21 +13,20 @@ class EMGEncoder(nnx.Module):
 
     def __init__(self, c_in: int, latent_dim: int, *, rngs: nnx.Rngs):
         self.rngs = rngs
-        self.conv1 = nnx.Conv(c_in, 64, kernel_size=(9,), strides=(2,), rngs=rngs)
-        self.conv2 = nnx.Conv(64, 128, kernel_size=(9,), strides=(2,), rngs=rngs)
-        self.conv3 = nnx.Conv(128, 128, kernel_size=(5,), strides=(1,), rngs=rngs)
+        self.conv1 = nnx.Conv(c_in, 32, kernel_size=(5,), strides=(2,), padding="SAME", rngs=rngs)
+        self.conv2 = nnx.Conv(32, 64, kernel_size=(5,), strides=(2,), padding="SAME", rngs=rngs)
+        self.conv3 = nnx.Conv(64, 64, kernel_size=(3,), strides=(1,), padding="SAME", rngs=rngs)
 
         #mean and logvar layers
-        self.mean = nnx.Conv(128, latent_dim, kernel_size=(1,), rngs=rngs)
-        self.logvar = nnx.Conv(128, latent_dim, kernel_size=(1,), rngs=rngs)
-
+        self.mean = nnx.Conv(64, latent_dim, kernel_size=(1,), padding="SAME", rngs=rngs)
+        self.logvar = nnx.Conv(64, latent_dim, kernel_size=(1,), padding="SAME", rngs=rngs)
 
     def __call__(self, x):  # x: [B, T, C]
         """Applies Encoder module."""
-        x = jnp.swapaxes(x, 1, 2) #[B, C, T]
+        # x = jnp.swapaxes(x, 1, 2) #[B, C, T]
         h = jax.nn.relu(self.conv1(x))
         h = jax.nn.relu(self.conv2(h))
-        h = jax.nn.relu(self.conv2(h))
+        h = jax.nn.relu(self.conv3(h))
 
         mean = self.mean(h)
         logvar = self.logvar(h)
@@ -37,9 +36,9 @@ class EMGEncoder(nnx.Module):
         z = mean + jnp.exp(0.5*logvar)*noise
 
         #reshape
-        z = jnp.swapaxes(z, 1, 2)
-        mean = jnp.swapaxes(mean, 1, 2)
-        logvar = jnp.swapaxes(logvar, 1, 2)
+        # z = jnp.swapaxes(z, 1, 2)
+        # mean = jnp.swapaxes(mean, 1, 2)
+        # logvar = jnp.swapaxes(logvar, 1, 2)
 
         return z, mean, logvar
     
@@ -49,34 +48,33 @@ class EMGDecoder(nnx.Module):
     def __init__(self, c_out: int, latent_dim: int, *, rngs: nnx.Rngs):
         self.rngs = rngs
         
-        self.p1 = nnx.Conv(latent_dim, 128, kernel_size=(1,), rngs=rngs)
+        self.p1 = nnx.Conv(latent_dim, 64, kernel_size=(1,), padding="SAME", rngs=rngs)
 
-        self.convT1 = nnx.ConvTranspose(128, 128, kernel_size=(9,), strides=(2,), rngs=rngs)
-        self.convT2 = nnx.ConvTranspose(128, 64, kernel_size=(9,), strides=(2,), rngs=rngs)
+        self.convT1 = nnx.ConvTranspose(64, 64, kernel_size=(5,), strides=(2,), padding="SAME", rngs=rngs)
+        self.convT2 = nnx.ConvTranspose(64, 32, kernel_size=(5,), strides=(2,), padding="SAME", rngs=rngs)
 
-        self.refine = nnx.Conv(64, 64, kernel_size=(5,), rngs=rngs)
-        self.out = nnx.Conv(64, c_out, kernel_size=(1,), rngs=rngs)
+        self.refine = nnx.Conv(32, 32, kernel_size=(3,), padding="SAME", rngs=rngs)
+        self.out = nnx.Conv(32, c_out, kernel_size=(1,), padding="SAME", rngs=rngs)
 
 
     def __call__(self, z_tokens, T_target: int):  # z_tokens: [B, T', D].
         """Applies Decoder module."""
-        z = jnp.swapaxes(z_tokens, 1, 2) #[B, D, T']
-        h = jax.nn.relu(self.p1(z))
+        # z = jnp.swapaxes(z_tokens, 1, 2) #[B, D, T']
+        h = jax.nn.relu(self.p1(z_tokens))
         h = jax.nn.relu(self.convT1(h))
         h = jax.nn.relu(self.convT2(h))
         h = jax.nn.relu(self.refine(h))
         x_hat = self.out(h)
 
-        T = x_hat.shape[-1]
+        T = x_hat.shape[1]
         if T == T_target:
             pass
         elif T > T_target:
-            x_hat = x_hat[..., :T_target]
+            x_hat = x_hat[:, :T_target, :]
         elif T < T_target:
-            x_hat = jnp.pad(x_hat, ((0, 0), (0, 0), (0, T_target - T)))
+            x_hat = jnp.pad(x_hat, ((0, 0), (0, T_target - T), (0, 0)))
         
-        x_hat = jnp.swapaxes(x_hat, 1, 2)
-
+        # x_hat = jnp.swapaxes(x_hat, 1, 2)
         return x_hat
 
 class EMGVAE(nnx.Module):
