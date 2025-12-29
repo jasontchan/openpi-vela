@@ -9,9 +9,11 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models.emg_vae_config import make_vae_from_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+from scripts.train_emg_vae import load_vae
 
 logger = logging.getLogger("openpi")
 
@@ -101,8 +103,14 @@ class Pi0(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
         if config.emg:
-            self.emg_proj = nnx.Linear(17, paligemma_config.width, rngs=rngs)
-            self.emg_ln = nnx.LayerNorm(16, epsilon=1e-5, use_scale=True, use_bias=True, rngs=rngs)
+            if config.encode_emg:
+                self.emg_vae, self.emg_vae_cfg = load_vae(make_vae_from_config, "checkpoints/emg_vae/best", rngs=rngs)
+                self.emg_encoder = self.emg_vae.encoder
+                self.emg_ln = nnx.LayerNorm(64, use_scale=True, use_bias=False, rngs=rngs)
+                self.emg_proj = nnx.Linear(64, paligemma_config.width, rngs=rngs)
+            else:
+                self.emg_proj = nnx.Linear(17, paligemma_config.width, rngs=rngs)
+                self.emg_ln = nnx.LayerNorm(16, epsilon=1e-5, use_scale=True, use_bias=True, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -112,37 +120,42 @@ class Pi0(_model.BaseModel):
         self, batch: at.Float[at.Array, "b wl ce"]
     ) -> at.Float[at.Array, "b k cc"]:
         emgs = batch
-        #double check emg dimensions are correct given batch (inference vs training etc)
-        #grab the last window_size timesteps 
-        emg_n_bins = 10
-        emg_window_size = 50
+        if self.config.encode_emg:
+            z, mu, logvar = self.emg_encoder(emgs)
+            print(f"EMGS SHAPE AFTER ENCODER {emgs.shape}", flush=True)
+            return z
+        else:
+            #double check emg dimensions are correct given batch (inference vs training etc)
+            #grab the last window_size timesteps 
+            emg_n_bins = 10
+            emg_window_size = 50
 
-        bin_size = emg_window_size // emg_n_bins
-        #split emgs into bins of size 'emg_bin_size'
-        emg_bins = jnp.stack(jnp.split(emgs, bin_size, axis=1), axis=1)
-        emg_bins = jnp.mean(emg_bins, axis=2, keepdims=False) # (B, K, C)
+            bin_size = emg_window_size // emg_n_bins
+            #split emgs into bins of size 'emg_bin_size'
+            emg_bins = jnp.stack(jnp.split(emgs, bin_size, axis=1), axis=1)
+            emg_bins = jnp.mean(emg_bins, axis=2, keepdims=False) # (B, K, C)
 
-        #amplitude (how strong the EMG signal is)
+            #amplitude (how strong the EMG signal is)
 
-        amplitude = jnp.sqrt(jnp.mean(jnp.power(emg_bins, 2), axis=-1, keepdims=True)) #(B, K, 1)
-        # amplitude = emg_bins.pow(2).mean(axis=-1, keepdim=True).sqrt() # (B, K, 1)
-        amplitude = jnp.clip((amplitude / (650 + 1e-6)), 0, 1.5) # normalize by 95th percentile
+            amplitude = jnp.sqrt(jnp.mean(jnp.power(emg_bins, 2), axis=-1, keepdims=True)) #(B, K, 1)
+            # amplitude = emg_bins.pow(2).mean(axis=-1, keepdim=True).sqrt() # (B, K, 1)
+            amplitude = jnp.clip((amplitude / (650 + 1e-6)), 0, 1.5) # normalize by 95th percentile
 
-        #spatial encoding (how the EMG signal is distributed across channels)
-        spatial_emg = emg_bins / (amplitude + 1e-6) # (B, K, C)
-        
-        #temporal encoding (how the EMG signal is distributed across time)
-        temporal_emg = jnp.pad(
-            emg_bins[:, 1:, :] - emg_bins[:, :-1, :], ((0, 0), (1, 0), (0, 0)) #pad first time dimension
-        ) #(B, K, C)
-        temporal_emg = temporal_emg / (jnp.linalg.norm(temporal_emg, axis=-1, keepdims=True) + 1e-6) # (B, K, C)
-
-        emgs = jnp.concatenate(
-            [spatial_emg, temporal_emg, amplitude], axis=-1
-        ) # (B, K, 2C+1)
-        print(f"EMGS SHAPE {emgs.shape}", flush=True)
+            #spatial encoding (how the EMG signal is distributed across channels)
+            spatial_emg = emg_bins / (amplitude + 1e-6) # (B, K, C)
             
-        return emgs
+            #temporal encoding (how the EMG signal is distributed across time)
+            temporal_emg = jnp.pad(
+                emg_bins[:, 1:, :] - emg_bins[:, :-1, :], ((0, 0), (1, 0), (0, 0)) #pad first time dimension
+            ) #(B, K, C)
+            temporal_emg = temporal_emg / (jnp.linalg.norm(temporal_emg, axis=-1, keepdims=True) + 1e-6) # (B, K, C)
+
+            emgs = jnp.concatenate(
+                [spatial_emg, temporal_emg, amplitude], axis=-1
+            ) # (B, K, 2C+1)
+            print(f"EMGS SHAPE {emgs.shape}", flush=True)
+            
+            return emgs
         
 
     @at.typecheck
@@ -179,13 +192,13 @@ class Pi0(_model.BaseModel):
         # add emg here
         if self.config.emg: # (32, 100, 8) ie (b, wl, ce)
             #embed emg via vae
-            emg_tokens = self.emg_vae(obs.emg)
-
-
             print(f"OBSERVATION EMG: {obs.emg}. size: {obs.emg.shape}")
             prepped_emg = self.prepare_emg(obs.emg)
-            emg_ln = jnp.concatenate((self.emg_ln(prepped_emg[:, :, :-1]), prepped_emg[:, :, -1:]), axis=-1)
-            emg_tokens = self.emg_proj(emg_ln)
+            if self.config.encode_emg:
+                emg_tokens = self.emg_proj(self.emg_ln(prepped_emg)) #z -> ln(z) -> vlm dim latents
+            else:
+                emg_ln = jnp.concatenate((self.emg_ln(prepped_emg[:, :, :-1]), prepped_emg[:, :, -1:]), axis=-1)
+                emg_tokens = self.emg_proj(emg_ln)
             tokens.append(emg_tokens)
 
             #make input_mask
