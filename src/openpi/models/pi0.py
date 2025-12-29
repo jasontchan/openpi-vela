@@ -122,6 +122,7 @@ class Pi0(_model.BaseModel):
         emgs = batch
         if self.config.encode_emg:
             z, mu, logvar = self.emg_encoder(emgs)
+            z = jax.lax.stop_gradient(z)
             print(f"EMGS SHAPE AFTER ENCODER {emgs.shape}", flush=True)
             return z
         else:
