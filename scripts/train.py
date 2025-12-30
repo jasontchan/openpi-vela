@@ -27,6 +27,9 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+from openpi.shared.load_vae import load_vae
+from openpi.models.emg_vae_config import make_vae_from_config
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -151,23 +154,52 @@ def debug_apply_filter_on_state(params, flt, title, max_lines=200):
     for k in matches[:max_lines]:
         print("  ", k)
 
+def drop_rngs(pure_dict: dict) -> dict:
+    flat = traverse_util.flatten_dict(pure_dict)
+    flat = {k: v for k, v in flat.items() if "rngs" not in k}
+    return traverse_util.unflatten_dict(flat)
+
+def load_encoder_partial(emg_ckpt_dir: str):
+    # load full VAE
+    vae, vae_cfg = load_vae(make_vae_from_config, emg_ckpt_dir, rngs=nnx.Rngs(0, noise=1))
+
+    # extract encoder state as pure dict
+    _, enc_state = nnx.split(vae.encoder)
+    enc_pure = enc_state.to_pure_dict()
+    enc_pure = drop_rngs(enc_pure)
+    # IMPORTANT: inject under the Pi0 field name emg_encoder
+    encoder_partial = {"emg_encoder": enc_pure}
+    return encoder_partial, vae_cfg
+
 @at.typecheck
 def init_train_state(
-    config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
+    config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool, extra_partial_params: Any = None
 ) -> tuple[training_utils.TrainState, Any]:
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
-    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
+    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None, extra_partial_params = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
         # initialize the model (and its parameters).
         model = config.model.create(model_rng)
 
         # Merge the partial params into the model.
+        # if partial_params is not None:
+        #     graphdef, state = nnx.split(model)
+        #     # This will produce an error if the partial params are not a subset of the state.
+        #     state.replace_by_pure_dict(partial_params)
+        #     if extra_partial_params is not None:
+        #         state.replace_by_pure_dict(extra_partial_params)
+        #     model = nnx.merge(graphdef, state)
+
+        graphdef, state = nnx.split(model)
+
         if partial_params is not None:
-            graphdef, state = nnx.split(model)
-            # This will produce an error if the partial params are not a subset of the state.
             state.replace_by_pure_dict(partial_params)
-            model = nnx.merge(graphdef, state)
+
+        if extra_partial_params is not None:
+            state.replace_by_pure_dict(extra_partial_params)
+
+        model = nnx.merge(graphdef, state)
 
         params = nnx.state(model)
         emg = params.filter(lambda p, _: p and p[0].startswith(("emg_proj","emg_norm","emg_to_pali")))
@@ -195,7 +227,7 @@ def init_train_state(
             ema_params=None if config.ema_decay is None else params,
         )
 
-    train_state_shape = jax.eval_shape(init, init_rng)
+    train_state_shape = jax.eval_shape(init, init_rng, None, None)
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume:
@@ -207,10 +239,10 @@ def init_train_state(
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
-        donate_argnums=(1,),  # donate the partial params buffer.
+        donate_argnums=(1, 2,),  # donate the partial params buffer.
         in_shardings=replicated_sharding,
         out_shardings=state_sharding,
-    )(init_rng, partial_params)
+    )(init_rng, partial_params, extra_partial_params)
 
     return train_state, state_sharding
 
@@ -297,6 +329,11 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
+
+    emg_ckpt_dir = "/lambda/nfs/filesystem1/openpi-vela/checkpoints/emg_vae/2025-12-22_23-40-24/epoch_023"
+    encoder_partial, emg_vae_cfg = load_encoder_partial(emg_ckpt_dir)
+    print("Loaded EMG encoder cfg:", emg_vae_cfg)
+
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     data_loader = _data_loader.create_data_loader(
@@ -315,8 +352,13 @@ def main(config: _config.TrainConfig):
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    train_state, train_state_sharding = init_train_state(
+        config, init_rng, mesh, resume=resuming,
+        extra_partial_params=encoder_partial,
+    )    
     # from flax.core import traverse_util
+    enc = train_state.params.filter(lambda p,_: p and p[0] == "emg_encoder")
+    print("EMG encoder leaves:", list(traverse_util.flatten_dict(enc.to_pure_dict(), sep="/").keys())[:50])
 
     def list_paths(state):
         return list(traverse_util.flatten_dict(state.to_pure_dict(), sep="/").keys())

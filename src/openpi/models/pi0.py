@@ -9,11 +9,12 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+from openpi.models.emg_vae import EMGEncoder
 from openpi.models.emg_vae_config import make_vae_from_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
-from scripts.train_emg_vae import load_vae
+from openpi.shared.load_vae import load_vae
 
 logger = logging.getLogger("openpi")
 
@@ -104,8 +105,9 @@ class Pi0(_model.BaseModel):
 
         if config.emg:
             if config.encode_emg:
-                self.emg_vae, self.emg_vae_cfg = load_vae(make_vae_from_config, "checkpoints/emg_vae/best", rngs=rngs)
-                self.emg_encoder = self.emg_vae.encoder
+                # self.emg_vae, self.emg_vae_cfg = load_vae(make_vae_from_config, "checkpoints/emg_vae/2025-12-22_23-40-24/epoch_023", rngs=rngs)
+                # self.emg_encoder = self.emg_vae.encoder
+                self.emg_encoder = EMGEncoder(c_in=8, latent_dim=64, rngs=rngs)
                 self.emg_ln = nnx.LayerNorm(64, use_scale=True, use_bias=False, rngs=rngs)
                 self.emg_proj = nnx.Linear(64, paligemma_config.width, rngs=rngs)
             else:
@@ -121,10 +123,12 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "b k cc"]:
         emgs = batch
         if self.config.encode_emg:
+            emgs = emgs[:, -50:, :]  # Take last 50 samples
+            emgs /= 1000.0
             z, mu, logvar = self.emg_encoder(emgs)
-            z = jax.lax.stop_gradient(z)
-            print(f"EMGS SHAPE AFTER ENCODER {emgs.shape}", flush=True)
-            return z
+            mu = jax.lax.stop_gradient(mu)
+            print(f"EMGS SHAPE AFTER ENCODER {mu.shape}", flush=True)
+            return mu
         else:
             #double check emg dimensions are correct given batch (inference vs training etc)
             #grab the last window_size timesteps 
